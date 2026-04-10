@@ -1,0 +1,17 @@
+data/raw/
+data/processed/
+experiments/results/
+*.pyc
+__pycache__/
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store
+third_party/SpCL/logs/
+third_party/SpCL/examples/logs/
+.ipynb_checkpoints/
+*.pth
+*.pt
+docs/
+.claude/

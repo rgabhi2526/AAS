@@ -1,0 +1,46 @@
+# AAS Reproduction Config
+# All hyperparameters fixed as per the paper (Section 4 / Appendix)
+
+# ── AAS hyperparameters ─────────────────────────────────────────────────────
+epsilon: 0.6          # balance between U_os (over-seg) and U_us (under-seg)
+k_max: 5              # max nearest-medoid neighbours for U_os
+s_min: 0.3            # min cosine similarity threshold for U_os pairs
+budget_fraction: 0.0002  # 0.02% of all possible pairs sampled per AL cycle
+
+# ── DBSCAN (used inside AAS for uncertainty region detection) ────────────────
+dbscan_eps: 0.5
+dbscan_min_samples: 4
+
+# ── SpCL pseudo-label generation (Jaccard-based DBSCAN) ─────────────────────
+pseudo_eps: 0.6       # DBSCAN eps for SpCL's Jaccard-distance clustering
+k1: 30                # Jaccard k1 (reciprocal kNN)
+k2: 6                 # Jaccard k2 (reciprocal kNN)
+
+# ── Training ─────────────────────────────────────────────────────────────────
+total_epochs: 50
+al_interval: 10       # run AAS every N epochs → 5 AL cycles
+lr: 0.00035
+weight_decay: 0.0005
+seed: 42
+
+# ── Data split ───────────────────────────────────────────────────────────────
+held_out_fraction: 0.2
+max_exemplars: 5
+
+# ── 13 datasets used in the AAS paper ───────────────────────────────────────
+# Verify these names match the 'dataset' column in WildlifeReID-10k metadata.csv
+# Run: python3 src/data/download.py data/raw   to see actual dataset names
+datasets:
+  - BelugaID
+  - CowDataset
+  - FriesianCattle2015
+  - GiraffeZebraID
+  - HyenaID2022
+  - IPanda50
+  - LeopardID2022
+  - MacaqueFaces
+  - NyalaData
+  - SealID
+  - WhaleSharkID
+  - HappyWhale
+  - ELPephants
