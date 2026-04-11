@@ -27,20 +27,21 @@ seed: 42
 held_out_fraction: 0.2
 max_exemplars: 5
 
-# ── 13 datasets used in the AAS paper ───────────────────────────────────────
-# Verify these names match the 'dataset' column in WildlifeReID-10k metadata.csv
-# Run: python3 src/data/download.py data/raw   to see actual dataset names
+# ── Datasets (read from dataset.txt at runtime) ──────────────────────────────
+# Source of truth is dataset.txt — names must match 'dataset' column in
+# WildlifeReID-10k metadata.csv.
+dataset_txt: dataset.txt
 datasets:
-  - BelugaID
+  - AmvrakikosTurtles
+  - CatIndividualImages
+  - Chicks4FreeID
   - CowDataset
-  - FriesianCattle2015
-  - GiraffeZebraID
-  - HyenaID2022
-  - IPanda50
-  - LeopardID2022
-  - MacaqueFaces
-  - NyalaData
-  - SealID
-  - WhaleSharkID
-  - HappyWhale
-  - ELPephants
+  - DogFaceNet
+  - MPDD
+  - MultiCamCows2024
+  - PolarBearVidID
+  - PrimFace
+  - ReunionTurtles
+  - SeaStarReID2023
+  - SouthernProvinceTurtles
+  - ZakynthosTurtles

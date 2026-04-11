@@ -99,6 +99,8 @@ def main():
     parser.add_argument('--config',     required=True)
     parser.add_argument('--dataset',    required=True,
                         help='Dataset name matching metadata.csv dataset column')
+    parser.add_argument('--dataset-txt', default='dataset.txt',
+                        help='path to dataset.txt listing datasets to use')
     parser.add_argument('--data-root',  required=True,
                         help='Root dir of WildlifeReID-10k (contains metadata.csv)')
     parser.add_argument('--output-dir', default='experiments/results')
@@ -112,7 +114,7 @@ def main():
     print(f"\n=== AAS: {args.dataset} | Run {args.run_id} | Device: {device} ===\n")
 
     # ── Data ─────────────────────────────────────────────────────────────────
-    df_all = load_metadata(args.data_root)
+    df_all = load_metadata(args.data_root, dataset_txt=args.dataset_txt)
     df = df_all[df_all['dataset'] == args.dataset].copy()
 
     if df.empty:
@@ -120,10 +122,11 @@ def main():
         raise ValueError(
             f"Dataset '{args.dataset}' not found.\n"
             f"Available: {available}\n"
-            f"Update PAPER_DATASETS_13 in src/data/download.py if needed."
+            f"Check dataset.txt at {args.dataset_txt}."
         )
 
-    # Factorize identity labels to contiguous 0-indexed integers
+    # Identity encoding is handled inside WildlifeSubsetDataset; factorize
+    # here so split logic downstream sees consistent integer labels.
     df['identity'] = df['identity'].factorize()[0]
 
     train_df = df[df['split'] == 'train'].reset_index(drop=True)
