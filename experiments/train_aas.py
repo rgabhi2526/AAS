@@ -135,7 +135,7 @@ def main():
     print("Extracting MegaDescriptor features for gallery selection...")
     train_ds_val = WildlifeSubsetDataset(train_df, root=args.data_root,
                                           transform=get_transforms('val'))
-    mega_feats = extract_features(train_ds_val, backbone='megadescriptor',
+    mega_feats = extract_features(train_ds_val, backbone='resnet50',
                                   device=device, num_workers=2)
 
     gallery_df, query_df, held_out_df = make_splits(
@@ -151,10 +151,13 @@ def main():
     # ── SpCL model + training ────────────────────────────────────────────────
     # NOTE: SpCL must be cloned to third_party/SpCL/
     # Run: cd third_party && git clone https://github.com/yxgeee/SpCL.git
+    # third_party/SpCL is already on sys.path (line 25), so import directly.
     try:
-        from spcl.models.resnet import ResNet
-        from spcl.trainers import SpCLTrainer
-        from spcl.utils.faiss_rerank import compute_jaccard_distance
+        from third_party.SpCL.spcl.models.resnet import ResNet
+        from third_party.SpCL.spcl.models.hm import HybridMemory
+        from third_party.SpCL.spcl.trainers import SpCLTrainer_USL
+        from third_party.SpCL.spcl.utils.data import IterLoader
+        from third_party.SpCL.spcl.utils.faiss_rerank import compute_jaccard_distance
     except ImportError as e:
         raise ImportError(
             "SpCL not found. Clone it first:\n"
@@ -163,14 +166,40 @@ def main():
         ) from e
 
     from sklearn.cluster import DBSCAN as skDBSCAN
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
 
-    model = ResNet(depth=50, num_features=2048, dropout=0, num_classes=0)
+    # WildlifeSubsetDataset returns (img, label, idx) — SpCLTrainer_USL._parse_data
+    # expects 5-tuple (imgs, _, pids, _, indexes).  Wrap with a collate adapter.
+    class _SpCLBatchAdapter(torch.utils.data.Dataset):
+        """Wraps WildlifeSubsetDataset to return the 5-tuple SpCL expects."""
+        def __init__(self, base_ds):
+            self._ds = base_ds
+        def __len__(self):
+            return len(self._ds)
+        def __getitem__(self, idx):
+            img, label, sample_idx = self._ds[idx]
+            # SpCL _parse_data: imgs, _, pids, _, indexes
+            return img, 0, label, 0, sample_idx
+
+    NUM_FEATURES = 2048
+    model = ResNet(depth=50, num_features=NUM_FEATURES, dropout=0, num_classes=0)
     model = model.to(device)
+
+    memory = HybridMemory(
+        NUM_FEATURES,
+        len(train_df),
+        temp=cfg.get('temp', 0.05),
+        momentum=cfg.get('momentum', 0.2),
+    ).to(device)
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.get('lr', 3.5e-4),
         weight_decay=cfg.get('weight_decay', 5e-4),
     )
+
+    trainer = SpCLTrainer_USL(model, memory)
 
     gt_labels = train_df['identity'].values
     al_interval = cfg.get('al_interval', 10)
@@ -190,9 +219,13 @@ def main():
         features = extract_features(train_ds_eval, backbone='resnet50',
                                     device=device, num_workers=2)
 
+        # Sync hybrid memory features (normalised)
+        feat_tensor = torch.tensor(features, dtype=torch.float32).to(device)
+        memory.features = F.normalize(feat_tensor, dim=1)
+
         # Generate SpCL pseudo-labels via Jaccard-distance DBSCAN
         rerank_dist = compute_jaccard_distance(
-            torch.tensor(features).to(device),
+            memory.features.clone(),
             k1=cfg.get('k1', 30),
             k2=cfg.get('k2', 6),
         )
@@ -212,18 +245,39 @@ def main():
             total_pairs_used += n_pairs
             al_cycle += 1
 
-        # Train one epoch with SpCL
-        n_classes = int((pseudo_labels[pseudo_labels >= 0]).max() + 1) if (pseudo_labels >= 0).any() else 1
-        trainer = SpCLTrainer(
-            model,
-            num_classes=n_classes,
-            memory_size=len(train_df),
-            device=device,
-        )
+        # Update memory labels (assign outliers to unique classes)
+        n_valid = int((pseudo_labels >= 0).sum())
+        n_clusters = int(pseudo_labels.max() + 1) if n_valid > 0 else 0
+        labels_for_memory = pseudo_labels.copy()
+        outlier_class = n_clusters
+        for i, lbl in enumerate(labels_for_memory):
+            if lbl < 0:
+                labels_for_memory[i] = outlier_class
+                outlier_class += 1
+        memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
+
+        # Build IterLoader from training dataset
         train_ds_train = WildlifeSubsetDataset(
             train_df, root=args.data_root, transform=get_transforms('train')
         )
-        trainer.train(epoch, train_ds_train, pseudo_labels, optimizer)
+        adapted_ds = _SpCLBatchAdapter(train_ds_train)
+        batch_size = cfg.get('batch_size', 64)
+        train_iters = cfg.get('train_iters', 400)
+        train_loader = IterLoader(
+            DataLoader(
+                adapted_ds,
+                batch_size=batch_size,
+                num_workers=cfg.get('num_workers', 4),
+                shuffle=True,
+                pin_memory=True,
+                drop_last=True,
+            ),
+            length=train_iters,
+        )
+        train_loader.new_epoch()
+        trainer.train(epoch, train_loader, optimizer,
+                      print_freq=cfg.get('print_freq', 50),
+                      train_iters=train_iters)
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     print("\nEvaluating...")
