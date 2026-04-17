@@ -32,7 +32,7 @@ from src.data.download import load_metadata
 from src.data.dataset import WildlifeSubsetDataset
 from src.data.transforms import get_transforms
 from src.data.splits import make_splits
-from src.data.features import extract_features, get_device
+from src.data.features import extract_features as extract_features_timm, get_device
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +48,23 @@ def compute_budget(n_samples: int, budget_fraction: float) -> int:
     """B = budget_fraction × (n choose 2)."""
     n_pairs = n_samples * (n_samples - 1) // 2
     return max(1, int(n_pairs * budget_fraction))
+
+
+@torch.no_grad()
+def extract_features_model(model, dataset, batch_size=64, num_workers=2):
+    """Extract L2-normalised features using the SpCL training model."""
+    from torch.utils.data import DataLoader
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+    all_feats = []
+    for batch in loader:
+        imgs = batch[0].cuda()
+        feats = model(imgs)
+        feats = torch.nn.functional.normalize(feats, dim=1)
+        all_feats.append(feats.cpu())
+    model.train()
+    return torch.cat(all_feats, dim=0)
 
 
 def run_al_cycle(
@@ -135,8 +152,8 @@ def main():
     print("Extracting MegaDescriptor features for gallery selection...")
     train_ds_val = WildlifeSubsetDataset(train_df, root=args.data_root,
                                           transform=get_transforms('val'))
-    mega_feats = extract_features(train_ds_val, backbone='resnet50',
-                                  device=device, num_workers=2)
+    mega_feats = extract_features_timm(train_ds_val, backbone='resnet50',
+                                       device=device, num_workers=2)
 
     gallery_df, query_df, held_out_df = make_splits(
         df,
@@ -208,20 +225,56 @@ def main():
     total_pairs_used = 0
     cycle_metrics = []
 
+    # ── Initialise memory with pretrained features (prevents NaN at epoch 0) ──
+    # SpCL requires semantically meaningful initial features so DBSCAN produces
+    # valid clusters from epoch 0.  Random-init features cause all samples to be
+    # outliers → unique class per sample → exp() overflow → NaN loss.
+    print("Initialising memory features from ImageNet-pretrained backbone...")
+    init_ds = WildlifeSubsetDataset(train_df, root=args.data_root,
+                                    transform=get_transforms('val'))
+    init_feats_np = extract_features_timm(init_ds, backbone='resnet50',
+                                          device=device,
+                                          num_workers=cfg.get('num_workers', 2))
+    memory.features = F.normalize(
+        torch.tensor(init_feats_np, dtype=torch.float32), dim=1
+    ).to(device)
+    print(f"Memory initialised: {memory.features.shape}")
+
+    # ── Build datasets and DataLoaders once (reuse across epochs) ────────────
+    batch_size  = cfg.get('batch_size', 64)
+    train_iters = cfg.get('train_iters', 400)
+
+    train_ds_eval  = WildlifeSubsetDataset(train_df, root=args.data_root,
+                                           transform=get_transforms('val'))
+    train_ds_train = WildlifeSubsetDataset(train_df, root=args.data_root,
+                                           transform=get_transforms('train'))
+    adapted_ds = _SpCLBatchAdapter(train_ds_train)
+    train_loader = IterLoader(
+        DataLoader(
+            adapted_ds,
+            batch_size=batch_size,
+            num_workers=cfg.get('num_workers', 2),
+            shuffle=True,
+            pin_memory=True,
+            drop_last=True,
+        ),
+        length=train_iters,
+    )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(total_epochs):
         print(f"\n[Epoch {epoch + 1}/{total_epochs}]")
 
-        # Extract features with current model
-        train_ds_eval = WildlifeSubsetDataset(
-            train_df, root=args.data_root, transform=get_transforms('val')
+        # Extract features with the *training* model (not a separate timm model)
+        feat_tensor = extract_features_model(
+            model, train_ds_eval,
+            batch_size=cfg.get('batch_size', 64),
+            num_workers=cfg.get('num_workers', 2),
         )
-        features = extract_features(train_ds_eval, backbone='resnet50',
-                                    device=device, num_workers=2)
+        features = feat_tensor.numpy()
 
-        # Sync hybrid memory features (normalised)
-        feat_tensor = torch.tensor(features, dtype=torch.float32).to(device)
-        memory.features = F.normalize(feat_tensor, dim=1)
+        # Sync hybrid memory features (already L2-normalised)
+        memory.features = feat_tensor.cuda()
 
         # Generate SpCL pseudo-labels via Jaccard-distance DBSCAN
         rerank_dist = compute_jaccard_distance(
@@ -234,7 +287,7 @@ def main():
             min_samples=4,
             metric='precomputed',
             n_jobs=-1,
-        ).fit_predict(rerank_dist.cpu().numpy())
+        ).fit_predict(rerank_dist)
 
         # ── AAS injection every al_interval epochs ─────────────────────────
         if epoch > 0 and (epoch + 1) % al_interval == 0:
@@ -256,24 +309,6 @@ def main():
                 outlier_class += 1
         memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
 
-        # Build IterLoader from training dataset
-        train_ds_train = WildlifeSubsetDataset(
-            train_df, root=args.data_root, transform=get_transforms('train')
-        )
-        adapted_ds = _SpCLBatchAdapter(train_ds_train)
-        batch_size = cfg.get('batch_size', 64)
-        train_iters = cfg.get('train_iters', 400)
-        train_loader = IterLoader(
-            DataLoader(
-                adapted_ds,
-                batch_size=batch_size,
-                num_workers=cfg.get('num_workers', 4),
-                shuffle=True,
-                pin_memory=True,
-                drop_last=True,
-            ),
-            length=train_iters,
-        )
         train_loader.new_epoch()
         trainer.train(epoch, train_loader, optimizer,
                       print_freq=cfg.get('print_freq', 50),
@@ -286,8 +321,10 @@ def main():
     query_ds   = WildlifeSubsetDataset(query_df,   root=args.data_root,
                                         transform=get_transforms('val'))
 
-    gallery_feats = extract_features(gallery_ds, backbone='resnet50', device=device)
-    query_feats   = extract_features(query_ds,   backbone='resnet50', device=device)
+    gallery_feats = extract_features_model(model, gallery_ds,
+                                           num_workers=cfg.get('num_workers', 2)).numpy()
+    query_feats   = extract_features_model(model, query_ds,
+                                           num_workers=cfg.get('num_workers', 2)).numpy()
 
     gallery_ids_set = set(gallery_df['identity'].unique())
     query_is_known  = np.array([lbl in gallery_ids_set for lbl in query_df['identity'].values])
