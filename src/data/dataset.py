@@ -79,8 +79,16 @@ class WildlifeSubsetDataset(Dataset):
             self._images: list = []
 
             if self._preloaded:
+                # Resize during preload to avoid storing full-resolution images
+                # in RAM (a 3000×2000 photo = 18 MB; at 256×128 = 98 KB).
+                # Both train and val transforms start with Resize((256, 128)),
+                # so the transform's Resize becomes a no-op.
+                _target = (256, 128)  # (height, width) — Re-ID standard
                 self._images = [
-                    Image.open(p).convert("RGB")
+                    Image.open(p).convert("RGB").resize(
+                        (_target[1], _target[0]),  # PIL takes (w, h)
+                        Image.BILINEAR,
+                    )
                     for p in tqdm(self._paths, desc="Preloading images",
                                   disable=self._len < 50)
                 ]
