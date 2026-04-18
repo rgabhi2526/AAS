@@ -36,6 +36,37 @@ from src.data.features import extract_features as extract_features_timm, get_dev
 
 
 # ---------------------------------------------------------------------------
+# NaN Diagnostic Logger
+# ---------------------------------------------------------------------------
+
+def _diag(name: str, t, log_file: str = "experiments/results/nan_diag.log"):
+    """Log tensor/array stats for NaN debugging."""
+    if isinstance(t, np.ndarray):
+        t = torch.tensor(t)
+    if not isinstance(t, torch.Tensor):
+        line = f"[DIAG] {name}: type={type(t).__name__} value={t}"
+    elif t.numel() == 0:
+        line = f"[DIAG] {name}: EMPTY shape={tuple(t.shape)}"
+    else:
+        tf = t.float().detach().cpu()
+        line = (
+            f"[DIAG] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"min={tf.min().item():.6f} max={tf.max().item():.6f} "
+            f"mean={tf.mean().item():.6f} std={tf.std().item():.6f} "
+            f"nan={torch.isnan(tf).sum().item()} inf={torch.isinf(tf).sum().item()}"
+        )
+        if tf.ndim == 2:
+            norms = tf.norm(dim=1)
+            line += (
+                f" | row_norms: min={norms.min().item():.4f} "
+                f"max={norms.max().item():.4f} mean={norms.mean().item():.4f}"
+            )
+    print(line)
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, "a") as f:
+        f.write(line + "\n")
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -225,6 +256,12 @@ def main():
     total_pairs_used = 0
     cycle_metrics = []
 
+    # ── Reset diagnostic log ────────────────────────────────────────────────
+    diag_path = "experiments/results/nan_diag.log"
+    os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+    with open(diag_path, "w") as f:
+        f.write(f"=== NaN diagnostic: {args.dataset} run={args.run_id} ===\n")
+
     # ── Initialise memory with pretrained features (prevents NaN at epoch 0) ──
     # SpCL requires semantically meaningful initial features so DBSCAN produces
     # valid clusters from epoch 0.  Random-init features cause all samples to be
@@ -239,6 +276,7 @@ def main():
         torch.tensor(init_feats_np, dtype=torch.float32), dim=1
     ).to(device)
     print(f"Memory initialised: {memory.features.shape}")
+    _diag("memory.features_pretrained_init", memory.features)
 
     # ── Build datasets and DataLoaders once (reuse across epochs) ────────────
     batch_size  = cfg.get('batch_size', 64)
@@ -272,9 +310,11 @@ def main():
             num_workers=cfg.get('num_workers', 2),
         )
         features = feat_tensor.numpy()
+        _diag(f"epoch{epoch}_feat_tensor", feat_tensor)
 
         # Sync hybrid memory features (already L2-normalised)
         memory.features = feat_tensor.cuda()
+        _diag(f"epoch{epoch}_memory.features", memory.features)
 
         # Generate SpCL pseudo-labels via Jaccard-distance DBSCAN
         rerank_dist = compute_jaccard_distance(
@@ -288,6 +328,13 @@ def main():
             metric='precomputed',
             n_jobs=-1,
         ).fit_predict(rerank_dist)
+
+        _n_valid   = int((pseudo_labels >= 0).sum())
+        _n_outlier = int((pseudo_labels < 0).sum())
+        _n_clusters = int(pseudo_labels.max() + 1) if _n_valid > 0 else 0
+        print(f"  DBSCAN: {_n_clusters} clusters, {_n_valid} valid, {_n_outlier} outliers "
+              f"(total={len(pseudo_labels)})")
+        _diag(f"epoch{epoch}_pseudo_labels", pseudo_labels)
 
         # ── AAS injection every al_interval epochs ─────────────────────────
         if epoch > 0 and (epoch + 1) % al_interval == 0:
@@ -308,11 +355,13 @@ def main():
                 labels_for_memory[i] = outlier_class
                 outlier_class += 1
         memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
+        _diag(f"epoch{epoch}_memory.labels", memory.labels)
 
         train_loader.new_epoch()
         trainer.train(epoch, train_loader, optimizer,
                       print_freq=cfg.get('print_freq', 50),
                       train_iters=train_iters)
+        _diag(f"epoch{epoch}_memory.features_post_train", memory.features)
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     print("\nEvaluating...")
