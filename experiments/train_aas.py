@@ -82,12 +82,15 @@ def compute_budget(n_samples: int, budget_fraction: float) -> int:
 
 
 @torch.no_grad()
-def extract_features_model(model, dataset, batch_size=64, num_workers=2):
-    """Extract L2-normalised features using the SpCL training model."""
-    from torch.utils.data import DataLoader
+def extract_features_model(model, loader):
+    """Extract L2-normalised features using the SpCL training model.
+
+    Args:
+        model:  the encoder (moved to eval mode internally).
+        loader: a pre-built DataLoader (reuse across calls to avoid
+                repeated worker spawn/teardown).
+    """
     model.eval()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
     all_feats = []
     for batch in loader:
         imgs = batch[0].cuda()
@@ -179,18 +182,27 @@ def main():
 
     train_df = df[df['split'] == 'train'].reset_index(drop=True)
 
-    # ── Gallery split (needs MegaDescriptor embeddings) ──────────────────────
-    print("Extracting MegaDescriptor features for gallery selection...")
-    train_ds_val = WildlifeSubsetDataset(train_df, root=args.data_root,
-                                          transform=get_transforms('val'))
-    mega_feats = extract_features_timm(train_ds_val, backbone='resnet50',
-                                       device=device, num_workers=2)
+    # ── Shared config values ──────────────────────────────────────────────────
+    batch_size  = cfg.get('batch_size', 64)
+    train_iters = cfg.get('train_iters', 400)
+    _nw = cfg.get('num_workers', 4)
+    val_transform  = get_transforms('val')
+    train_transform = get_transforms('train')
+
+    # ── Single eval dataset (reused for gallery split, init, and per-epoch) ──
+    train_ds_eval = WildlifeSubsetDataset(train_df, root=args.data_root,
+                                          transform=val_transform)
+
+    # ── Extract pretrained features ONCE (used for gallery split + memory init)
+    print("Extracting pretrained features (gallery selection + memory init)...")
+    pretrained_feats = extract_features_timm(train_ds_eval, backbone='resnet50',
+                                             device=device, num_workers=_nw)
 
     gallery_df, query_df, held_out_df = make_splits(
         df,
         held_out_fraction=cfg.get('held_out_fraction', 0.2),
         max_exemplars=cfg.get('max_exemplars', 5),
-        embeddings=mega_feats,
+        embeddings=pretrained_feats,
         seed=cfg['seed'] + args.run_id,
     )
     print(f"Split — train: {len(train_df)} | gallery: {len(gallery_df)} | "
@@ -263,31 +275,31 @@ def main():
         f.write(f"=== NaN diagnostic: {args.dataset} run={args.run_id} ===\n")
 
     # ── Initialise memory with pretrained features (prevents NaN at epoch 0) ──
-    # SpCL requires semantically meaningful initial features so DBSCAN produces
-    # valid clusters from epoch 0.  Random-init features cause all samples to be
-    # outliers → unique class per sample → exp() overflow → NaN loss.
-    print("Initialising memory features from ImageNet-pretrained backbone...")
-    init_ds = WildlifeSubsetDataset(train_df, root=args.data_root,
-                                    transform=get_transforms('val'))
-    init_feats_np = extract_features_timm(init_ds, backbone='resnet50',
-                                          device=device,
-                                          num_workers=cfg.get('num_workers', 2))
+    # Reuse the features already extracted above (no second timm model / pass).
     memory.features = F.normalize(
-        torch.tensor(init_feats_np, dtype=torch.float32), dim=1
+        torch.tensor(pretrained_feats, dtype=torch.float32), dim=1
     ).to(device)
     print(f"Memory initialised: {memory.features.shape}")
     _diag("memory.features_pretrained_init", memory.features)
 
-    # ── Build datasets and DataLoaders once (reuse across epochs) ────────────
-    batch_size  = cfg.get('batch_size', 64)
-    train_iters = cfg.get('train_iters', 400)
+    # ── Build DataLoaders once (reuse across all epochs) ─────────────────────
+    # Eval loader: used for per-epoch feature extraction (50× reused)
+    eval_loader = DataLoader(
+        train_ds_eval,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=_nw,
+        pin_memory=True,
+        persistent_workers=(_nw > 0),
+    )
 
-    train_ds_eval  = WildlifeSubsetDataset(train_df, root=args.data_root,
-                                           transform=get_transforms('val'))
-    train_ds_train = WildlifeSubsetDataset(train_df, root=args.data_root,
-                                           transform=get_transforms('train'))
+    # Training loader: share preloaded images from eval dataset (no 2nd disk read)
+    train_ds_train = WildlifeSubsetDataset(
+        train_df, root=args.data_root,
+        transform=train_transform,
+        shared_images=train_ds_eval._images if train_ds_eval._preloaded else None,
+    )
     adapted_ds = _SpCLBatchAdapter(train_ds_train)
-    _nw = cfg.get('num_workers', 4)
     train_loader = IterLoader(
         DataLoader(
             adapted_ds,
@@ -306,12 +318,8 @@ def main():
     for epoch in range(total_epochs):
         print(f"\n[Epoch {epoch + 1}/{total_epochs}]")
 
-        # Extract features with the *training* model (not a separate timm model)
-        feat_tensor = extract_features_model(
-            model, train_ds_eval,
-            batch_size=cfg.get('batch_size', 64),
-            num_workers=cfg.get('num_workers', 2),
-        )
+        # Extract features with the *training* model (reuses eval_loader)
+        feat_tensor = extract_features_model(model, eval_loader)
         features = feat_tensor.numpy()
         _diag(f"epoch{epoch}_feat_tensor", feat_tensor)
 
@@ -348,15 +356,14 @@ def main():
             total_pairs_used += n_pairs
             al_cycle += 1
 
-        # Update memory labels (assign outliers to unique classes)
+        # Update memory labels (assign outliers to unique classes — vectorised)
         n_valid = int((pseudo_labels >= 0).sum())
         n_clusters = int(pseudo_labels.max() + 1) if n_valid > 0 else 0
         labels_for_memory = pseudo_labels.copy()
-        outlier_class = n_clusters
-        for i, lbl in enumerate(labels_for_memory):
-            if lbl < 0:
-                labels_for_memory[i] = outlier_class
-                outlier_class += 1
+        outlier_mask = labels_for_memory < 0
+        labels_for_memory[outlier_mask] = np.arange(
+            n_clusters, n_clusters + outlier_mask.sum(), dtype=labels_for_memory.dtype
+        )
         memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
         _diag(f"epoch{epoch}_memory.labels", memory.labels)
 
@@ -369,14 +376,17 @@ def main():
     # ── Evaluation ────────────────────────────────────────────────────────────
     print("\nEvaluating...")
     gallery_ds = WildlifeSubsetDataset(gallery_df, root=args.data_root,
-                                        transform=get_transforms('val'))
+                                        transform=val_transform)
     query_ds   = WildlifeSubsetDataset(query_df,   root=args.data_root,
-                                        transform=get_transforms('val'))
+                                        transform=val_transform)
 
-    gallery_feats = extract_features_model(model, gallery_ds,
-                                           num_workers=cfg.get('num_workers', 2)).numpy()
-    query_feats   = extract_features_model(model, query_ds,
-                                           num_workers=cfg.get('num_workers', 2)).numpy()
+    gallery_loader = DataLoader(gallery_ds, batch_size=batch_size, shuffle=False,
+                                num_workers=_nw, pin_memory=True)
+    query_loader   = DataLoader(query_ds,   batch_size=batch_size, shuffle=False,
+                                num_workers=_nw, pin_memory=True)
+
+    gallery_feats = extract_features_model(model, gallery_loader).numpy()
+    query_feats   = extract_features_model(model, query_loader).numpy()
 
     gallery_ids_set = set(gallery_df['identity'].unique())
     query_is_known  = np.array([lbl in gallery_ids_set for lbl in query_df['identity'].values])

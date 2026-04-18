@@ -1,11 +1,12 @@
 """Unified PyTorch dataset wrapping WildlifeReID-10k subsets."""
 import os
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 class WildlifeSubsetDataset(Dataset):
@@ -21,54 +22,86 @@ class WildlifeSubsetDataset(Dataset):
                    automatically; the mapping is stored in `self.identity_map`.
         root:      Root directory prepended to each 'path' value.
         transform: torchvision transform applied to PIL images.
+        preload:   If True, load all images into RAM during __init__
+                   (before DataLoader forks workers, so they inherit via
+                   copy-on-write with zero extra memory).
+                   If None (default), auto-enable for datasets ≤ 10 000 images.
+        shared_images:
+                   Optional pre-loaded list of PIL images (same length as df).
+                   When provided, skips disk I/O entirely — use this to share
+                   one set of preloaded images across eval/train datasets that
+                   differ only by transform.
     """
 
-    # Datasets with at most this many images get automatic in-memory caching
-    # to avoid repeated disk I/O.  Above this threshold caching is skipped
-    # to prevent OOM (e.g. 140k images on Colab).
-    _CACHE_THRESHOLD: int = 10_000
+    _PRELOAD_THRESHOLD: int = 10_000
 
     def __init__(
         self,
         df: pd.DataFrame,
         root: str,
         transform: Optional[Callable] = None,
-        cache_images: Optional[bool] = None,
+        preload: Optional[bool] = None,
+        shared_images: Optional[List[Image.Image]] = None,
     ):
-        self.df = df.reset_index(drop=True).copy()
+        df = df.reset_index(drop=True).copy()
         self.root = root
         self.transform = transform
         self.identity_map: dict = {}  # int_label -> original_string (if encoded)
 
-        # Auto-gate caching: on for small datasets, off for large ones
-        if cache_images is None:
-            cache_images = len(self.df) <= self._CACHE_THRESHOLD
-        self._cache_images = cache_images
-        self._image_cache: dict = {}
-
         # Encode string identities to consecutive integers
-        if not pd.api.types.is_integer_dtype(self.df["identity"]):
-            cats = pd.Categorical(self.df["identity"])
-            self.df["identity"] = cats.codes
+        if not pd.api.types.is_integer_dtype(df["identity"]):
+            cats = pd.Categorical(df["identity"])
+            df["identity"] = cats.codes
             self.identity_map = dict(enumerate(cats.categories))
 
+        # ── Pre-extract arrays (eliminates df.iloc overhead in __getitem__) ──
+        self._paths: list = [
+            os.path.join(root, p) for p in df["path"].values
+        ]
+        self._labels: np.ndarray = df["identity"].values.astype(np.int64)
+        self._len: int = len(df)
+
+        # Keep df for any external inspection
+        self.df = df
+
+        # ── Preload / share images ──────────────────────────────────────────
+        if shared_images is not None:
+            # Reuse an existing preloaded list (zero extra RAM or I/O)
+            assert len(shared_images) == self._len, (
+                f"shared_images length {len(shared_images)} != dataset length {self._len}"
+            )
+            self._images = shared_images
+            self._preloaded = True
+        else:
+            if preload is None:
+                preload = self._len <= self._PRELOAD_THRESHOLD
+            self._preloaded = preload
+            self._images: list = []
+
+            if self._preloaded:
+                self._images = [
+                    Image.open(p).convert("RGB")
+                    for p in tqdm(self._paths, desc="Preloading images",
+                                  disable=self._len < 50)
+                ]
+
     def __len__(self) -> int:
-        return len(self.df)
+        return self._len
 
     def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        if self._cache_images and idx in self._image_cache:
-            image = self._image_cache[idx].copy()
+        if self._preloaded:
+            # Copy-on-write read from preloaded list — no disk I/O,
+            # no .copy() needed because transforms create new tensors.
+            image = self._images[idx]
         else:
-            img_path = os.path.join(self.root, row["path"])
-            image = Image.open(img_path).convert("RGB")
-            if self._cache_images:
-                self._image_cache[idx] = image.copy()
+            image = Image.open(self._paths[idx]).convert("RGB")
+
         if self.transform:
             image = self.transform(image)
-        return image, int(row["identity"]), idx
+
+        return image, int(self._labels[idx]), idx
 
     @property
     def identities(self) -> np.ndarray:
         """(n,) integer array of identity labels."""
-        return self.df["identity"].values.astype(int)
+        return self._labels
