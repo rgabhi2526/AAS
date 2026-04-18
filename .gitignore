@@ -13,9 +13,11 @@ build/
 *.pt
 graphify-out/
 .vscode/
-./claude
-./code-review-graph
-.cursor
+.claude/
+.cursor/
+.kiro/
 .pytest_cache/
 .cursorrules
 *.md
+# Added by code-review-graph
+.code-review-graph/
