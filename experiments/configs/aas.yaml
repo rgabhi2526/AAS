@@ -22,6 +22,10 @@ al_interval: 10       # run AAS every N epochs → 5 AL cycles
 lr: 0.00035
 weight_decay: 0.0005
 seed: 42
+batch_size: 64
+train_iters: 400
+num_workers: 4        # Colab GPU has 2 CPUs; I/O-bound workers benefit from >2
+print_freq: 50
 
 # ── Data split ───────────────────────────────────────────────────────────────
 held_out_fraction: 0.2

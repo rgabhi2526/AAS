@@ -23,16 +23,28 @@ class WildlifeSubsetDataset(Dataset):
         transform: torchvision transform applied to PIL images.
     """
 
+    # Datasets with at most this many images get automatic in-memory caching
+    # to avoid repeated disk I/O.  Above this threshold caching is skipped
+    # to prevent OOM (e.g. 140k images on Colab).
+    _CACHE_THRESHOLD: int = 10_000
+
     def __init__(
         self,
         df: pd.DataFrame,
         root: str,
         transform: Optional[Callable] = None,
+        cache_images: Optional[bool] = None,
     ):
         self.df = df.reset_index(drop=True).copy()
         self.root = root
         self.transform = transform
         self.identity_map: dict = {}  # int_label -> original_string (if encoded)
+
+        # Auto-gate caching: on for small datasets, off for large ones
+        if cache_images is None:
+            cache_images = len(self.df) <= self._CACHE_THRESHOLD
+        self._cache_images = cache_images
+        self._image_cache: dict = {}
 
         # Encode string identities to consecutive integers
         if not pd.api.types.is_integer_dtype(self.df["identity"]):
@@ -45,8 +57,13 @@ class WildlifeSubsetDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        img_path = os.path.join(self.root, row["path"])
-        image = Image.open(img_path).convert("RGB")
+        if self._cache_images and idx in self._image_cache:
+            image = self._image_cache[idx].copy()
+        else:
+            img_path = os.path.join(self.root, row["path"])
+            image = Image.open(img_path).convert("RGB")
+            if self._cache_images:
+                self._image_cache[idx] = image.copy()
         if self.transform:
             image = self.transform(image)
         return image, int(row["identity"]), idx

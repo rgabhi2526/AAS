@@ -12,19 +12,19 @@ OUTPUT_DIR=${2:-experiments/results}
 CONFIG=experiments/configs/aas.yaml
 
 DATASETS=(
-  BelugaID
+  AmvrakikosTurtles
+  atIndividualImages
+  Chicks4FreeID
   CowDataset
-  FriesianCattle2015
-  GiraffeZebraID
-  HyenaID2022
-  IPanda50
-  LeopardID2022
-  MacaqueFaces
-  NyalaData
-  SealID
-  WhaleSharkID
-  HappyWhale
-  ELPephants
+  DogFaceNet
+  MPDD
+  MultiCamCows2024
+  PolarBearVidID
+  PrimFace
+  ReunionTurtles
+  SeaStarReID2023
+  SouthernProvinceTurtles
+  ZakynthosTurtles
 )
 
 mkdir -p "$OUTPUT_DIR"

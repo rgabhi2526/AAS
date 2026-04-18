@@ -215,7 +215,7 @@ def main():
 
     from sklearn.cluster import DBSCAN as skDBSCAN
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, RandomSampler
 
     # WildlifeSubsetDataset returns (img, label, idx) — SpCLTrainer_USL._parse_data
     # expects 5-tuple (imgs, _, pids, _, indexes).  Wrap with a collate adapter.
@@ -287,14 +287,17 @@ def main():
     train_ds_train = WildlifeSubsetDataset(train_df, root=args.data_root,
                                            transform=get_transforms('train'))
     adapted_ds = _SpCLBatchAdapter(train_ds_train)
+    _nw = cfg.get('num_workers', 4)
     train_loader = IterLoader(
         DataLoader(
             adapted_ds,
             batch_size=batch_size,
-            num_workers=cfg.get('num_workers', 2),
-            shuffle=True,
+            num_workers=_nw,
+            sampler=RandomSampler(adapted_ds, replacement=True,
+                                  num_samples=batch_size * train_iters),
             pin_memory=True,
             drop_last=True,
+            persistent_workers=(_nw > 0),
         ),
         length=train_iters,
     )

@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "code-review-graph update --skip-flows",
-            "timeout": 5000
+            "command": "/Users/abhyudayavasisht/.local/bin/uvx code-review-graph update --skip-flows",
+            "timeout": 30
           }
         ]
       }
@@ -18,8 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "code-review-graph status",
-            "timeout": 3000
+            "command": "/Users/abhyudayavasisht/.local/bin/uvx code-review-graph status",
+            "timeout": 10
           }
         ]
       }
