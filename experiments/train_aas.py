@@ -145,6 +145,29 @@ def run_al_cycle(
 # Main
 # ---------------------------------------------------------------------------
 
+def _ckpt_path(output_dir, dataset, run_id, tag='latest'):
+    """Return checkpoint file path for given tag ('latest' or 'best')."""
+    return os.path.join(output_dir, f"{dataset}_run{run_id}_ckpt_{tag}.pth")
+
+
+def save_checkpoint(path, epoch, model, optimizer, memory, al_cycle,
+                    total_pairs_used, best_loss, consec_low, **extra):
+    """Save training state to disk."""
+    ckpt = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'memory_features': memory.features.cpu(),
+        'memory_labels': memory.labels.cpu(),
+        'al_cycle': al_cycle,
+        'total_pairs_used': total_pairs_used,
+        'best_loss': best_loss,
+        'consec_low': consec_low,
+    }
+    ckpt.update(extra)
+    torch.save(ckpt, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description='AAS Re-ID reproduction')
     parser.add_argument('--config',     required=True)
@@ -157,6 +180,8 @@ def main():
     parser.add_argument('--output-dir', default='experiments/results')
     parser.add_argument('--run-id',     type=int, default=0,
                         help='Run index 0-3 (used for seed offset and output filename)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from the latest checkpoint')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -267,6 +292,14 @@ def main():
     al_cycle = 0
     total_pairs_used = 0
     cycle_metrics = []
+    start_epoch = 0
+    best_loss = float('inf')
+    consec_low = 0  # consecutive epochs below early-stop threshold
+
+    # ── Early stopping config ────────────────────────────────────────────────
+    es_threshold = cfg.get('early_stop_threshold', 0.005)
+    es_patience  = cfg.get('early_stop_patience', 5)
+    es_min_epoch = cfg.get('early_stop_min_epoch', 15)
 
     # ── Reset diagnostic log ────────────────────────────────────────────────
     diag_path = "experiments/results/nan_diag.log"
@@ -281,6 +314,27 @@ def main():
     ).to(device)
     print(f"Memory initialised: {memory.features.shape}")
     _diag("memory.features_pretrained_init", memory.features)
+
+    # ── Resume from checkpoint (if requested) ────────────────────────────────
+    ckpt_latest = _ckpt_path(args.output_dir, args.dataset, args.run_id, 'latest')
+    if args.resume and os.path.isfile(ckpt_latest):
+        print(f"\nResuming from checkpoint: {ckpt_latest}")
+        ckpt = torch.load(ckpt_latest, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        memory.features = ckpt['memory_features'].to(device)
+        memory.labels = ckpt['memory_labels'].to(device)
+        start_epoch = ckpt['epoch'] + 1
+        al_cycle = ckpt.get('al_cycle', 0)
+        total_pairs_used = ckpt.get('total_pairs_used', 0)
+        best_loss = ckpt.get('best_loss', float('inf'))
+        consec_low = ckpt.get('consec_low', 0)
+        print(f"  Resuming from epoch {start_epoch}, al_cycle={al_cycle}, "
+              f"best_loss={best_loss:.6f}")
+        del ckpt
+    elif args.resume:
+        print(f"WARNING: --resume set but no checkpoint found at {ckpt_latest}. "
+              f"Starting from scratch.")
 
     # ── Build DataLoaders once (reuse across all epochs) ─────────────────────
     # Eval loader: used for per-epoch feature extraction (50× reused)
@@ -315,7 +369,48 @@ def main():
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    for epoch in range(total_epochs):
+    # Patch the trainer to capture the epoch-avg loss for early stopping.
+    # SpCLTrainer_USL.train() prints it but doesn't return it.
+    _original_train = trainer.train.__func__
+    _last_epoch_loss = [float('inf')]  # mutable container for closure
+
+    def _train_with_loss_capture(self, epoch, data_loader, optimizer,
+                                 print_freq=10, train_iters=400):
+        """Wrapper that captures the epoch-average loss."""
+        import time
+        self.encoder.train()
+        from third_party.SpCL.spcl.utils.meters import AverageMeter
+        losses = AverageMeter()
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        end = time.time()
+        for i in range(train_iters):
+            inputs = data_loader.next()
+            data_time.update(time.time() - end)
+            inputs, _, indexes = self._parse_data(inputs)
+            f_out = self._forward(inputs)
+            loss = self.memory(f_out, indexes)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.update(loss.item())
+            batch_time.update(time.time() - end)
+            end = time.time()
+            if (i + 1) % print_freq == 0:
+                print('Epoch: [{}][{}/{}]\t'
+                      'Time {:.3f} ({:.3f})\t'
+                      'Data {:.3f} ({:.3f})\t'
+                      'Loss {:.3f} ({:.3f})'
+                      .format(epoch, i + 1, len(data_loader),
+                              batch_time.val, batch_time.avg,
+                              data_time.val, data_time.avg,
+                              losses.val, losses.avg))
+        _last_epoch_loss[0] = losses.avg
+
+    import types
+    trainer.train = types.MethodType(_train_with_loss_capture, trainer)
+
+    for epoch in range(start_epoch, total_epochs):
         print(f"\n[Epoch {epoch + 1}/{total_epochs}]")
 
         # Extract features with the *training* model (reuses eval_loader)
@@ -348,6 +443,7 @@ def main():
         _diag(f"epoch{epoch}_pseudo_labels", pseudo_labels)
 
         # ── AAS injection every al_interval epochs ─────────────────────────
+        aas_ran = False
         if epoch > 0 and (epoch + 1) % al_interval == 0:
             print(f"  Running AAS cycle {al_cycle + 1}...")
             pseudo_labels, n_pairs = run_al_cycle(
@@ -355,6 +451,7 @@ def main():
             )
             total_pairs_used += n_pairs
             al_cycle += 1
+            aas_ran = True
 
         # Update memory labels (assign outliers to unique classes — vectorised)
         n_valid = int((pseudo_labels >= 0).sum())
@@ -372,6 +469,38 @@ def main():
                       print_freq=cfg.get('print_freq', 50),
                       train_iters=train_iters)
         _diag(f"epoch{epoch}_memory.features_post_train", memory.features)
+
+        # ── Checkpoint (latest + best) ─────────────────────────────────────
+        epoch_loss = _last_epoch_loss[0]
+        save_checkpoint(
+            _ckpt_path(args.output_dir, args.dataset, args.run_id, 'latest'),
+            epoch, model, optimizer, memory,
+            al_cycle, total_pairs_used, best_loss, consec_low,
+        )
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            save_checkpoint(
+                _ckpt_path(args.output_dir, args.dataset, args.run_id, 'best'),
+                epoch, model, optimizer, memory,
+                al_cycle, total_pairs_used, best_loss, consec_low,
+            )
+            print(f"  ★ New best loss: {best_loss:.6f} (saved best checkpoint)")
+
+        # ── Early stopping ─────────────────────────────────────────────────
+        if aas_ran:
+            # AAS injection spikes loss; reset counter
+            consec_low = 0
+        elif epoch >= es_min_epoch and epoch_loss < es_threshold:
+            consec_low += 1
+            print(f"  Early-stop counter: {consec_low}/{es_patience} "
+                  f"(loss={epoch_loss:.6f} < {es_threshold})")
+        else:
+            consec_low = 0
+
+        if consec_low >= es_patience:
+            print(f"\n✓ Early stopping at epoch {epoch + 1} "
+                  f"(loss < {es_threshold} for {es_patience} consecutive epochs)")
+            break
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     print("\nEvaluating...")

@@ -21,3 +21,4 @@ graphify-out/
 *.md
 # Added by code-review-graph
 .code-review-graph/
+train_log.txt
