@@ -317,6 +317,12 @@ def main():
     _diag("memory.features_pretrained_init", memory.features)
 
     # ── Resume from checkpoint (if requested) ────────────────────────────────
+    # ── Per-window early stopping config ──────────────────────────────────
+    ws_threshold = cfg.get('window_stop_threshold', 0.01)
+    ws_patience  = cfg.get('window_stop_patience', 2)
+    window_counter  = 0
+    skip_to_next_aas = False
+
     ckpt_latest = _ckpt_path(args.output_dir, args.dataset, args.run_id, 'latest')
     if args.resume and os.path.isfile(ckpt_latest):
         print(f"\nResuming from checkpoint: {ckpt_latest}")
@@ -330,6 +336,7 @@ def main():
         total_pairs_used = ckpt.get('total_pairs_used', 0)
         best_loss = ckpt.get('best_loss', float('inf'))
         consec_low = ckpt.get('consec_low', 0)
+        window_counter = ckpt.get('window_counter', 0)
         print(f"  Resuming from epoch {start_epoch}, al_cycle={al_cycle}, "
               f"best_loss={best_loss:.6f}")
         del ckpt
@@ -412,6 +419,16 @@ def main():
     trainer.train = types.MethodType(_train_with_loss_capture, trainer)
 
     for epoch in range(start_epoch, total_epochs):
+        # ── Per-window skip: if window converged, jump to next AAS epoch ──
+        is_aas_epoch = (epoch > 0 and (epoch + 1) % al_interval == 0)
+        if skip_to_next_aas and not is_aas_epoch:
+            print(f"\n[Epoch {epoch + 1}/{total_epochs}] ⏭ skipped (window converged)")
+            continue
+        if is_aas_epoch:
+            # Reset window state — new AAS cycle will inject fresh labels
+            skip_to_next_aas = False
+            window_counter = 0
+
         print(f"\n[Epoch {epoch + 1}/{total_epochs}]")
 
         # Extract features with the *training* model (reuses eval_loader)
@@ -477,6 +494,7 @@ def main():
             _ckpt_path(args.output_dir, args.dataset, args.run_id, 'latest'),
             epoch, model, optimizer, memory,
             al_cycle, total_pairs_used, best_loss, consec_low,
+            window_counter=window_counter,
         )
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -484,10 +502,21 @@ def main():
                 _ckpt_path(args.output_dir, args.dataset, args.run_id, 'best'),
                 epoch, model, optimizer, memory,
                 al_cycle, total_pairs_used, best_loss, consec_low,
+                window_counter=window_counter,
             )
             print(f"  ★ New best loss: {best_loss:.6f} (saved best checkpoint)")
 
-        # ── Early stopping ─────────────────────────────────────────────────
+        # ── Per-window convergence check ────────────────────────────────────
+        if not aas_ran and epoch_loss < ws_threshold:
+            window_counter += 1
+            if window_counter >= ws_patience:
+                skip_to_next_aas = True
+                print(f"  ⏭ Window converged (loss < {ws_threshold} for "
+                      f"{ws_patience} consecutive epochs) — skipping to next AAS cycle")
+        elif not aas_ran:
+            window_counter = 0
+
+        # ── Global early stopping ──────────────────────────────────────────
         if aas_ran:
             # AAS injection spikes loss; reset counter
             consec_low = 0
