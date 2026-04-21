@@ -11,6 +11,9 @@ budget_fraction: 0.002  # 0.2% of all possible pairs sampled per AL cycle
 dbscan_eps: 0.5
 dbscan_min_samples: 4
 
+# ── FINCH ────────────────────────────────────────────────────────────────────
+finch_partition: 0    # FINCH partition level (0 = finest, most complementary to DBSCAN)
+
 # ── SpCL pseudo-label generation (Jaccard-based DBSCAN) ─────────────────────
 pseudo_eps: 0.6       # DBSCAN eps for SpCL's Jaccard-distance clustering
 k1: 30                # Jaccard k1 (reciprocal kNN)

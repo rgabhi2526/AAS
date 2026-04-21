@@ -107,12 +107,18 @@ def run_al_cycle(
     pseudo_labels: np.ndarray,
     cfg: dict,
     cycle: int,
+    all_must_links: list,
+    all_cannot_links: list,
 ) -> tuple:
     """
     One AAS active-learning cycle:
-      1. Run AAS  →  sample B pairs
+      1. Run AAS  →  sample B pairs (constrained by existing ML/CL)
       2. Query GT oracle  →  ML / CL constraints
-      3. Refine pseudo-labels with NP3
+      3. Accumulate constraints with all previous cycles
+      4. Refine pseudo-labels with NP3 using ALL accumulated constraints
+
+    The `all_must_links` and `all_cannot_links` lists are mutated in-place
+    (extended with this cycle's new constraints).
 
     Returns:
         refined_labels: (n,) np.ndarray
@@ -129,15 +135,24 @@ def run_al_cycle(
         dbscan_eps=cfg['dbscan_eps'],
         dbscan_min_samples=cfg['dbscan_min_samples'],
         seed=cfg['seed'] + cycle,
+        existing_ml=all_must_links,
+        existing_cl=all_cannot_links,
+        finch_partition=cfg.get('finch_partition', 0),
     )
 
     oracle = GTOracle(gt_labels)
-    must_links, cannot_links = oracle.query(pairs)
+    new_ml, new_cl = oracle.query(pairs)
+
+    # Accumulate constraints (mutates the lists held by caller)
+    all_must_links.extend(new_ml)
+    all_cannot_links.extend(new_cl)
 
     print(f"  [Cycle {cycle}] budget={budget} | queried={len(pairs)} | "
-          f"ML={len(must_links)} | CL={len(cannot_links)}")
+          f"new_ML={len(new_ml)} | new_CL={len(new_cl)} | "
+          f"total_ML={len(all_must_links)} | total_CL={len(all_cannot_links)}")
 
-    refined = refine_labels(pseudo_labels, must_links, cannot_links,
+    # Refine with ALL accumulated constraints
+    refined = refine_labels(pseudo_labels, all_must_links, all_cannot_links,
                             features=features)
     return refined, len(pairs)
 
@@ -215,24 +230,36 @@ def main():
     val_transform  = get_transforms('val')
     train_transform = get_transforms('train')
 
-    # ── Single eval dataset (reused for gallery split, init, and per-epoch) ──
+    # ── Single eval dataset (reused for memory init and per-epoch extraction) ──
     train_ds_eval = WildlifeSubsetDataset(train_df, root=args.data_root,
                                           transform=val_transform)
 
-    # ── Extract pretrained features ONCE (used for gallery split + memory init)
-    print("Extracting pretrained features (gallery selection + memory init)...")
-    pretrained_feats = extract_features_timm(train_ds_eval, backbone='resnet50',
-                                             device=device, num_workers=_nw)
+    # ── Gallery exemplar selection with MegaDescriptor (paper protocol) ───────
+    # Paper: "up to five exemplars per ID were selected ... using MegaDescriptor
+    # based similarity." Uses 384×384 input, one-time extraction then discarded.
+    print("Extracting MegaDescriptor features (gallery exemplar selection)...")
+    mega_transform = get_transforms('megadescriptor')
+    mega_ds = WildlifeSubsetDataset(train_df, root=args.data_root,
+                                    transform=mega_transform)
+    gallery_feats = extract_features_timm(mega_ds, backbone='megadescriptor',
+                                          device=device, num_workers=_nw)
+    del mega_ds  # free memory
 
     gallery_df, query_df, held_out_df = make_splits(
         df,
         held_out_fraction=cfg.get('held_out_fraction', 0.2),
         max_exemplars=cfg.get('max_exemplars', 5),
-        embeddings=pretrained_feats,
+        embeddings=gallery_feats,
         seed=cfg['seed'] + args.run_id,
     )
+    del gallery_feats  # no longer needed
     print(f"Split — train: {len(train_df)} | gallery: {len(gallery_df)} | "
           f"query: {len(query_df)} | held-out: {len(held_out_df)}")
+
+    # ── ResNet-50 features for SpCL memory init ──────────────────────────────
+    print("Extracting ResNet-50 features (memory init)...")
+    pretrained_feats = extract_features_timm(train_ds_eval, backbone='resnet50',
+                                             device=device, num_workers=_nw)
 
     # ── SpCL model + training ────────────────────────────────────────────────
     # NOTE: SpCL must be cloned to third_party/SpCL/
@@ -297,6 +324,10 @@ def main():
     best_loss = float('inf')
     consec_low = 0  # consecutive epochs below early-stop threshold
 
+    # Accumulated constraints across all AAS cycles (Fix 1)
+    all_must_links = []
+    all_cannot_links = []
+
     # ── Early stopping config ────────────────────────────────────────────────
     es_threshold = cfg.get('early_stop_threshold', 0.005)
     es_patience  = cfg.get('early_stop_patience', 5)
@@ -337,6 +368,8 @@ def main():
         best_loss = ckpt.get('best_loss', float('inf'))
         consec_low = ckpt.get('consec_low', 0)
         window_counter = ckpt.get('window_counter', 0)
+        all_must_links = ckpt.get('all_must_links', [])
+        all_cannot_links = ckpt.get('all_cannot_links', [])
         print(f"  Resuming from epoch {start_epoch}, al_cycle={al_cycle}, "
               f"best_loss={best_loss:.6f}")
         del ckpt
@@ -465,7 +498,8 @@ def main():
         if epoch > 0 and (epoch + 1) % al_interval == 0:
             print(f"  Running AAS cycle {al_cycle + 1}...")
             pseudo_labels, n_pairs = run_al_cycle(
-                features, gt_labels, pseudo_labels, cfg, al_cycle
+                features, gt_labels, pseudo_labels, cfg, al_cycle,
+                all_must_links, all_cannot_links,
             )
             total_pairs_used += n_pairs
             al_cycle += 1
@@ -495,6 +529,8 @@ def main():
             epoch, model, optimizer, memory,
             al_cycle, total_pairs_used, best_loss, consec_low,
             window_counter=window_counter,
+            all_must_links=all_must_links,
+            all_cannot_links=all_cannot_links,
         )
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -503,6 +539,8 @@ def main():
                 epoch, model, optimizer, memory,
                 al_cycle, total_pairs_used, best_loss, consec_low,
                 window_counter=window_counter,
+                all_must_links=all_must_links,
+                all_cannot_links=all_cannot_links,
             )
             print(f"  ★ New best loss: {best_loss:.6f} (saved best checkpoint)")
 

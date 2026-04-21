@@ -65,6 +65,18 @@ def compute_metrics(
         max_sims = sim_matrix.max(axis=1)
         results['AUCROC'] = float(roc_auc_score(query_is_known.astype(int), max_sims))
 
+        # BAUS: Balanced Accuracy on Unknown Samples
+        # Paper: "uses a fixed threshold on Re-ID scores to determine whether
+        # the query is 'known' or 'unknown'."
+        # Threshold: median of known-query max-similarities (paper doesn't specify)
+        known_max_sims = max_sims[query_is_known.astype(bool)]
+        threshold = float(np.median(known_max_sims)) if len(known_max_sims) > 0 else 0.5
+        predictions = (max_sims >= threshold).astype(int)
+        from sklearn.metrics import balanced_accuracy_score
+        results['BAUS'] = float(balanced_accuracy_score(
+            query_is_known.astype(int), predictions
+        ))
+
     return results
 
 

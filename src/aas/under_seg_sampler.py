@@ -16,7 +16,7 @@ def sample_under_seg_pairs(
     labels_a: np.ndarray,
     labels_b: np.ndarray,
     features: np.ndarray,
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], List[dict]]:
     """
     Construct U_us: non-redundant inconsistent pairs within uncertainty regions.
 
@@ -35,10 +35,13 @@ def sample_under_seg_pairs(
 
     Returns:
         pairs: list of unique (i, j) pairs (i < j) for U_us
+        meta:  list of dicts with 'region' and 'type' (1=inlier-inlier,
+               2=inlier-outlier, 3=outlier-outlier per DBSCAN labels_a)
     """
     all_pairs: Set[Tuple[int, int]] = set()
+    pair_meta: dict = {}   # (i, j) -> {'region': k, 'type': int}
 
-    for region in regions:
+    for region_idx, region in enumerate(regions):
         a_groups: dict = defaultdict(set)
         b_groups: dict = defaultdict(set)
         for idx in region:
@@ -56,9 +59,22 @@ def sample_under_seg_pairs(
         all_group_sets = list(a_groups.values()) + list(b_groups.values())
         p_cand = _closest_inter_cluster_pairs(all_group_sets, features)
 
-        all_pairs |= (i_tilde & p_cand)
+        filtered = i_tilde & p_cand
+        for pair in filtered:
+            all_pairs.add(pair)
+            # Classify pair type by DBSCAN inlier/outlier status
+            i_is_inlier = (labels_a[pair[0]] != -1)
+            j_is_inlier = (labels_a[pair[1]] != -1)
+            if i_is_inlier and j_is_inlier:
+                pair_type = 1   # β1: inlier-inlier
+            elif i_is_inlier or j_is_inlier:
+                pair_type = 2   # β2: inlier-outlier
+            else:
+                pair_type = 3   # β3: outlier-outlier
+            pair_meta[pair] = {'region': region_idx, 'type': pair_type}
 
-    return list(all_pairs)
+    meta_list = [pair_meta.get(p, {'region': 0, 'type': 1}) for p in all_pairs]
+    return list(all_pairs), meta_list
 
 
 # ---------------------------------------------------------------------------
