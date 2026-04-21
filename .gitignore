@@ -22,3 +22,4 @@ graphify-out/
 # Added by code-review-graph
 .code-review-graph/
 train_log.txt
+temp.ipynb

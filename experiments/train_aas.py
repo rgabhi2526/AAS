@@ -137,7 +137,8 @@ def run_al_cycle(
     print(f"  [Cycle {cycle}] budget={budget} | queried={len(pairs)} | "
           f"ML={len(must_links)} | CL={len(cannot_links)}")
 
-    refined = refine_labels(pseudo_labels, must_links, cannot_links)
+    refined = refine_labels(pseudo_labels, must_links, cannot_links,
+                            features=features)
     return refined, len(pairs)
 
 

@@ -5,7 +5,7 @@
 epsilon: 0.6          # balance between U_os (over-seg) and U_us (under-seg)
 k_max: 5              # max nearest-medoid neighbours for U_os
 s_min: 0.3            # min cosine similarity threshold for U_os pairs
-budget_fraction: 0.0002  # 0.02% of all possible pairs sampled per AL cycle
+budget_fraction: 0.002  # 0.2% of all possible pairs sampled per AL cycle
 
 # ── DBSCAN (used inside AAS for uncertainty region detection) ────────────────
 dbscan_eps: 0.5
