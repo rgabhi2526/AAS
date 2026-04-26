@@ -1,6 +1,10 @@
 import os
+os.environ['MPLBACKEND'] = 'Agg'
 import matplotlib
-matplotlib.use('Agg')
+try:
+    matplotlib.use('Agg', force=True)
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 import numpy as np
 
