@@ -516,6 +516,24 @@ def main():
             al_cycle += 1
             aas_ran = True
 
+        # Synchronous UMAP visualization
+        try:
+            from src.visualization.umap_vis import plot_epoch_umap
+            viz_dir = os.path.join(args.output_dir, args.dataset, args.run_id, 'visualizations')
+            os.makedirs(viz_dir, exist_ok=True)
+            # gt_labels might be uninitialized if epoch > 0 and no AAS ran in this epoch
+            # Let's just fetch it again to be safe
+            _viz_gt = train_df['identity'].values
+            plot_epoch_umap(
+                epoch=epoch,
+                features=features,
+                pseudo_labels=pseudo_labels,
+                gt_labels=_viz_gt,
+                output_dir=viz_dir
+            )
+        except Exception as e:
+            print(f"  [Viz] Failed to generate UMAP: {e}")
+
         # Update memory labels (assign outliers to unique classes — vectorised)
         n_valid = int((pseudo_labels >= 0).sum())
         n_clusters = int(pseudo_labels.max() + 1) if n_valid > 0 else 0
