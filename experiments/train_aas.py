@@ -493,6 +493,17 @@ def main():
               f"(total={len(pseudo_labels)})")
         _diag(f"epoch{epoch}_pseudo_labels", pseudo_labels)
 
+        # Apply accumulated ML constraints to pseudo-labels every epoch
+        # This ensures NP3's merge decisions persist across DBSCAN re-clustering
+        if all_must_links:
+            from src.aas.np3 import _merge_must_links
+            pre_merge_clusters = int(pseudo_labels.max() + 1) if (pseudo_labels >= 0).any() else 0
+            pseudo_labels = _merge_must_links(pseudo_labels.copy(), all_must_links)
+            post_merge_clusters = int(pseudo_labels.max() + 1) if (pseudo_labels >= 0).any() else 0
+            if pre_merge_clusters != post_merge_clusters:
+                print(f"  ML merge: {pre_merge_clusters} → {post_merge_clusters} clusters "
+                      f"({pre_merge_clusters - post_merge_clusters} merged)")
+
         # ── AAS injection every al_interval epochs ─────────────────────────
         aas_ran = False
         if epoch > 0 and (epoch + 1) % al_interval == 0:
