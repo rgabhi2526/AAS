@@ -453,7 +453,7 @@ def main():
 
     for epoch in range(start_epoch, total_epochs):
         # ── Per-window skip: if window converged, jump to next AAS epoch ──
-        is_aas_epoch = (epoch > 0 and (epoch + 1) % al_interval == 0)
+        is_aas_epoch = (epoch == 0) or (epoch > 0 and (epoch + 1) % al_interval == 0)
         if skip_to_next_aas and not is_aas_epoch:
             print(f"\n[Epoch {epoch + 1}/{total_epochs}] ⏭ skipped (window converged)")
             continue
@@ -504,9 +504,9 @@ def main():
                 print(f"  ML merge: {pre_merge_clusters} → {post_merge_clusters} clusters "
                       f"({pre_merge_clusters - post_merge_clusters} merged)")
 
-        # ── AAS injection every al_interval epochs ─────────────────────────
+        # ── AAS injection every al_interval epochs (and epoch 0) ───────────
         aas_ran = False
-        if epoch > 0 and (epoch + 1) % al_interval == 0:
+        if epoch == 0 or (epoch > 0 and (epoch + 1) % al_interval == 0):
             print(f"  Running AAS cycle {al_cycle + 1}...")
             pseudo_labels, n_pairs = run_al_cycle(
                 features, gt_labels, pseudo_labels, cfg, al_cycle,
