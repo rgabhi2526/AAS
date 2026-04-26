@@ -519,7 +519,7 @@ def main():
         # Synchronous UMAP visualization
         try:
             from src.visualization.umap_vis import plot_epoch_umap
-            viz_dir = os.path.join(args.output_dir, args.dataset, args.run_id, 'visualizations')
+            viz_dir = os.path.join(args.output_dir, args.dataset, str(args.run_id), 'visualizations')
             os.makedirs(viz_dir, exist_ok=True)
             # gt_labels might be uninitialized if epoch > 0 and no AAS ran in this epoch
             # Let's just fetch it again to be safe
