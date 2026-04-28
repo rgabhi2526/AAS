@@ -24,3 +24,4 @@ graphify-out/
 train_log.txt
 temp.ipynb
 nan_diag.txt
+*.pdf

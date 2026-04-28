@@ -468,14 +468,47 @@ def main():
     # expects 5-tuple (imgs, _, pids, _, indexes).  Wrap with a collate adapter.
     class _SpCLBatchAdapter(torch.utils.data.Dataset):
         """Wraps WildlifeSubsetDataset to return the 5-tuple SpCL expects."""
-        def __init__(self, base_ds):
+        def __init__(self, base_ds, pseudo_labels=None):
             self._ds = base_ds
+            self.pseudo_labels = pseudo_labels
+
         def __len__(self):
             return len(self._ds)
+
         def __getitem__(self, idx):
-            img, label, sample_idx = self._ds[idx]
-            # SpCL _parse_data: imgs, _, pids, _, indexes
-            return img, 0, label, 0, sample_idx
+            img, gt_label, sample_idx = self._ds[idx]
+            # Use pseudo-label if provided, otherwise gt_label
+            pid = self.pseudo_labels[idx] if self.pseudo_labels is not None else gt_label
+            return img, 0, pid, 0, sample_idx
+
+    from torch.utils.data.sampler import Sampler
+
+    class PKLabelSampler(Sampler):
+        """SpCL-style PK sampler ensuring K instances per P identities in a batch."""
+        def __init__(self, pseudo_labels, num_instances=4):
+            self.pseudo_labels = pseudo_labels
+            self.num_instances = num_instances
+            self.index_dic = collections.defaultdict(list)
+            for index, pid in enumerate(pseudo_labels):
+                self.index_dic[pid].append(index)
+            self.pids = list(self.index_dic.keys())
+            self.num_samples = len(self.pids)
+
+        def __len__(self):
+            return self.num_samples * self.num_instances
+
+        def __iter__(self):
+            indices = torch.randperm(self.num_samples).tolist()
+            ret = []
+            for i in indices:
+                pid = self.pids[i]
+                t = self.index_dic[pid]
+                if len(t) >= self.num_instances:
+                    t = np.random.choice(t, size=self.num_instances, replace=False)
+                else:
+                    t = np.random.choice(t, size=self.num_instances, replace=True)
+                ret.extend(t)
+            return iter(ret)
 
     NUM_FEATURES = 2048
     model = ResNet(depth=50, num_features=NUM_FEATURES, dropout=0, num_classes=0)
@@ -582,20 +615,25 @@ def main():
         transform=train_transform,
         shared_images=train_ds_eval._images if train_ds_eval._preloaded else None,
     )
-    adapted_ds = _SpCLBatchAdapter(train_ds_train)
-    train_loader = IterLoader(
-        DataLoader(
-            adapted_ds,
-            batch_size=batch_size,
-            num_workers=_nw,
-            sampler=RandomSampler(adapted_ds, replacement=True,
-                                  num_samples=batch_size * train_iters),
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=(_nw > 0),
-        ),
-        length=train_iters,
-    )
+    def build_train_loader(p_labels):
+        """Rebuild DataLoader every epoch to sample from new pseudo_labels."""
+        adapted_ds = _SpCLBatchAdapter(train_ds_train, pseudo_labels=p_labels)
+        sampler = PKLabelSampler(p_labels, num_instances=4)
+        return IterLoader(
+            DataLoader(
+                adapted_ds,
+                batch_size=batch_size,
+                num_workers=_nw,
+                sampler=sampler,
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=(_nw > 0),
+            ),
+            length=train_iters,
+        )
+
+    # Initialise train_loader with None (will be built inside epoch loop)
+    train_loader = None
 
     # ── Training loop ─────────────────────────────────────────────────────────
     # Patch the trainer to capture the epoch-avg loss for early stopping.
@@ -726,6 +764,9 @@ def main():
 
         # Feature quality monitor (Fix 3: track intra/inter identity similarity)
         log_feature_quality(features, gt_labels, pseudo_labels, epoch)
+
+        # ── Rebuild Dataloader with new pseudo-labels (PK sampling) ────────
+        train_loader = build_train_loader(pseudo_labels)
 
         train_loader.new_epoch()
         trainer.train(epoch, train_loader, optimizer,
