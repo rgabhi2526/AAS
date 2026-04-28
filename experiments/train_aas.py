@@ -16,6 +16,7 @@ import os
 import argparse
 import json
 import yaml
+import collections
 import numpy as np
 import torch
 
@@ -81,60 +82,140 @@ def compute_budget(n_samples: int, budget_fraction: float) -> int:
     return max(1, int(n_pairs * budget_fraction))
 
 
-def assign_outliers_to_nearest_cluster(
-    pseudo_labels: np.ndarray,
-    features: np.ndarray,
-) -> np.ndarray:
-    """Assign DBSCAN outliers (label == -1) to the nearest cluster centroid.
+def self_paced_pseudo_labels(
+    rerank_dist: np.ndarray,
+    eps: float,
+    eps_gap: float = 0.02,
+    indep_thres: float = None,
+    indep_thres_pct: float = 0.9,
+) -> tuple:
+    """SpCL's three-DBSCAN self-paced pseudo-label generation.
 
-    Instead of giving each outlier its own singleton class (which inflates the
-    effective class count in contrastive memory and creates a positive feedback
-    loop of feature fragmentation), each outlier is assigned to the cluster
-    whose L2-normalised centroid has the highest cosine similarity.
+    Runs DBSCAN at three epsilon values (tight, normal, loose) to measure
+    cluster reliability.  Unreliable samples are demoted to singletons.
+    This is the "self-paced" curriculum: only confident cluster assignments
+    contribute to contrastive learning; uncertain samples are maintained as
+    individual instances until features improve enough for DBSCAN to assign
+    them reliably.
+
+    Reference: Ge et al., "Self-paced Contrastive Learning with Hybrid
+    Memory for Domain Adaptive Object Re-ID", NeurIPS 2020.
 
     Args:
-        pseudo_labels: (n,) cluster labels; -1 = outlier.
-        features:      (n, d) L2-normalised features.
+        rerank_dist:      (n, n) precomputed Jaccard distance matrix.
+        eps:              DBSCAN epsilon for the normal clustering.
+        eps_gap:          offset for tight (eps-gap) and loose (eps+gap).
+        indep_thres:      R_indep threshold; None = auto-compute (epoch 0).
+        indep_thres_pct:  percentile for auto-threshold (default 0.9).
 
     Returns:
-        labels: (n,) with all outliers reassigned (no -1 values remain).
+        pseudo_labels:  (n,) numpy int64 array.  Reliable cluster members
+                        keep IDs 0..K-1; unreliable samples get unique
+                        singleton IDs ≥ K.
+        indep_thres:    the threshold used (cache for subsequent epochs).
+        stats:          dict with diagnostic counts.
     """
-    labels = pseudo_labels.copy()
-    outlier_mask = labels < 0
-    n_outliers = int(outlier_mask.sum())
+    from sklearn.cluster import DBSCAN as skDBSCAN
 
-    if n_outliers == 0:
-        return labels
+    eps_tight = eps - eps_gap
+    eps_loose = eps + eps_gap
 
-    valid_mask = labels >= 0
-    if not valid_mask.any():
-        # Edge case: all samples are outliers — assign all to cluster 0
-        labels[:] = 0
-        return labels
+    # --- Three DBSCAN runs ------------------------------------------------
+    pl       = skDBSCAN(eps=eps,       min_samples=4, metric='precomputed', n_jobs=-1).fit_predict(rerank_dist)
+    pl_tight = skDBSCAN(eps=eps_tight, min_samples=4, metric='precomputed', n_jobs=-1).fit_predict(rerank_dist)
+    pl_loose = skDBSCAN(eps=eps_loose, min_samples=4, metric='precomputed', n_jobs=-1).fit_predict(rerank_dist)
 
-    # Compute L2-normalised centroids for each cluster
-    unique_clusters = np.unique(labels[valid_mask])
-    centroids = np.zeros((len(unique_clusters), features.shape[1]), dtype=np.float32)
-    cluster_id_map = {}  # index in centroids array → cluster label
-    for i, c in enumerate(unique_clusters):
-        c_feats = features[labels == c]
-        centroid = c_feats.mean(axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid /= norm
-        centroids[i] = centroid
-        cluster_id_map[i] = c
+    num_ids       = len(set(pl))       - (1 if -1 in pl else 0)
+    num_ids_tight = len(set(pl_tight)) - (1 if -1 in pl_tight else 0)
+    num_ids_loose = len(set(pl_loose)) - (1 if -1 in pl_loose else 0)
 
-    # Vectorised assignment: (n_outliers, d) @ (d, n_clusters) → similarities
-    outlier_indices = np.where(outlier_mask)[0]
-    outlier_feats = features[outlier_indices]            # (n_outliers, d)
-    sims = outlier_feats @ centroids.T                   # (n_outliers, n_clusters)
-    best_cluster_idx = sims.argmax(axis=1)               # (n_outliers,)
+    n_outliers_raw = int((pl == -1).sum())
 
-    for i, idx in enumerate(outlier_indices):
-        labels[idx] = cluster_id_map[best_cluster_idx[i]]
+    # --- Assign outliers to unique singletons (first pass) ----------------
+    def _assign_singletons(cluster_ids, n_clusters):
+        labels = []
+        outliers = 0
+        for cid in cluster_ids:
+            if cid != -1:
+                labels.append(cid)
+            else:
+                labels.append(n_clusters + outliers)
+                outliers += 1
+        return torch.tensor(labels, dtype=torch.long)
 
-    return labels
+    pseudo_labels       = _assign_singletons(pl, num_ids)
+    pseudo_labels_tight = _assign_singletons(pl_tight, num_ids_tight)
+    pseudo_labels_loose = _assign_singletons(pl_loose, num_ids_loose)
+
+    # --- Compute R_indep and R_comp ---------------------------------------
+    N = pseudo_labels.size(0)
+    label_sim       = pseudo_labels.expand(N, N).eq(pseudo_labels.expand(N, N).t()).float()
+    label_sim_tight = pseudo_labels_tight.expand(N, N).eq(pseudo_labels_tight.expand(N, N).t()).float()
+    label_sim_loose = pseudo_labels_loose.expand(N, N).eq(pseudo_labels_loose.expand(N, N).t()).float()
+
+    R_comp  = 1 - torch.min(label_sim, label_sim_tight).sum(-1) / torch.max(label_sim, label_sim_tight).sum(-1)
+    R_indep = 1 - torch.min(label_sim, label_sim_loose).sum(-1) / torch.max(label_sim, label_sim_loose).sum(-1)
+    assert (R_comp.min() >= 0) and (R_comp.max() <= 1)
+    assert (R_indep.min() >= 0) and (R_indep.max() <= 1)
+
+    # --- Cluster-level reliability scores ---------------------------------
+    cluster_R_comp  = collections.defaultdict(list)
+    cluster_R_indep = collections.defaultdict(list)
+    cluster_img_num = collections.defaultdict(int)
+    for i, (comp, indep, label) in enumerate(zip(R_comp, R_indep, pseudo_labels)):
+        cluster_R_comp[label.item()].append(comp.item())
+        cluster_R_indep[label.item()].append(indep.item())
+        cluster_img_num[label.item()] += 1
+
+    cluster_R_comp  = [min(cluster_R_comp[i])  for i in sorted(cluster_R_comp.keys())]
+    cluster_R_indep = [min(cluster_R_indep[i]) for i in sorted(cluster_R_indep.keys())]
+    cluster_R_indep_noins = [
+        iou for iou, num in zip(cluster_R_indep, sorted(cluster_img_num.keys()))
+        if cluster_img_num[num] > 1
+    ]
+
+    # --- Threshold (auto-compute at epoch 0, reuse later) -----------------
+    if indep_thres is None:
+        if len(cluster_R_indep_noins) > 0:
+            idx = min(len(cluster_R_indep_noins) - 1,
+                      int(np.round(len(cluster_R_indep_noins) * indep_thres_pct)))
+            indep_thres = np.sort(cluster_R_indep_noins)[idx]
+        else:
+            indep_thres = 0.5  # fallback
+
+    # --- Self-paced filtering (second pass) -------------------------------
+    n_demoted = 0
+    filtered_labels = pseudo_labels.clone()
+    for i, label in enumerate(pseudo_labels):
+        _indep = cluster_R_indep[label.item()]
+        _comp  = R_comp[i].item()
+        if _indep <= indep_thres and _comp <= cluster_R_comp[label.item()]:
+            pass  # reliable — keep label
+        else:
+            filtered_labels[i] = len(cluster_R_indep) + n_demoted
+            n_demoted += 1
+
+    # --- Statistics -------------------------------------------------------
+    index2label = collections.defaultdict(int)
+    for lbl in filtered_labels:
+        index2label[lbl.item()] += 1
+    counts = np.fromiter(index2label.values(), dtype=float)
+    n_clusters_final = int((counts > 1).sum())
+    n_singletons     = int((counts == 1).sum())
+
+    stats = {
+        'n_clusters_dbscan': num_ids,
+        'n_clusters_tight':  num_ids_tight,
+        'n_clusters_loose':  num_ids_loose,
+        'n_outliers_raw':    n_outliers_raw,
+        'n_demoted':         n_demoted,
+        'n_clusters_final':  n_clusters_final,
+        'n_singletons':      n_singletons,
+        'n_total_classes':   n_clusters_final + n_singletons,
+        'indep_thres':       indep_thres,
+    }
+
+    return filtered_labels.numpy(), indep_thres, stats
 
 
 def log_feature_quality(
@@ -380,7 +461,6 @@ def main():
             "  pip install -e third_party/SpCL/"
         ) from e
 
-    from sklearn.cluster import DBSCAN as skDBSCAN
     import torch.nn.functional as F
     from torch.utils.data import DataLoader, RandomSampler
 
@@ -414,6 +494,10 @@ def main():
         weight_decay=cfg.get('weight_decay', 5e-4),
     )
 
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=cfg.get('step_size', 20), gamma=0.1
+    )
+
     trainer = SpCLTrainer_USL(model, memory)
 
     gt_labels = train_df['identity'].values
@@ -425,6 +509,7 @@ def main():
     start_epoch = 0
     best_loss = float('inf')
     consec_low = 0  # consecutive epochs below early-stop threshold
+    indep_thres = None  # SpCL self-paced R_indep threshold (auto-computed at epoch 0)
 
     # Accumulated constraints across all AAS cycles (Fix 1)
     all_must_links = []
@@ -472,6 +557,7 @@ def main():
         window_counter = ckpt.get('window_counter', 0)
         all_must_links = ckpt.get('all_must_links', [])
         all_cannot_links = ckpt.get('all_cannot_links', [])
+        indep_thres = ckpt.get('indep_thres', None)
         print(f"  Resuming from epoch {start_epoch}, al_cycle={al_cycle}, "
               f"best_loss={best_loss:.6f}")
         del ckpt
@@ -575,36 +661,36 @@ def main():
         memory.features = feat_tensor.cuda()
         _diag(f"epoch{epoch}_memory.features", memory.features)
 
-        # Generate SpCL pseudo-labels via Jaccard-distance DBSCAN
+        # SpCL self-paced pseudo-label generation (three-DBSCAN + reliability filter)
         rerank_dist = compute_jaccard_distance(
             memory.features.clone(),
             k1=cfg.get('k1', 30),
             k2=cfg.get('k2', 6),
         )
-        pseudo_labels = skDBSCAN(
+        pseudo_labels, indep_thres, sp_stats = self_paced_pseudo_labels(
+            rerank_dist,
             eps=cfg.get('pseudo_eps', 0.6),
-            min_samples=4,
-            metric='precomputed',
-            n_jobs=-1,
-        ).fit_predict(rerank_dist)
-
-        _n_valid   = int((pseudo_labels >= 0).sum())
-        _n_outlier = int((pseudo_labels < 0).sum())
-        _n_clusters = int(pseudo_labels.max() + 1) if _n_valid > 0 else 0
-        print(f"  DBSCAN: {_n_clusters} clusters, {_n_valid} valid, {_n_outlier} outliers "
-              f"(total={len(pseudo_labels)})")
+            eps_gap=cfg.get('eps_gap', 0.02),
+            indep_thres=indep_thres if epoch > 0 else None,
+            indep_thres_pct=cfg.get('indep_thres_pct', 0.9),
+        )
+        print(f"  Self-paced: {sp_stats['n_clusters_dbscan']} DBSCAN clusters, "
+              f"{sp_stats['n_outliers_raw']} raw outliers → "
+              f"{sp_stats['n_clusters_final']} reliable clusters + "
+              f"{sp_stats['n_singletons']} singletons = "
+              f"{sp_stats['n_total_classes']} total classes "
+              f"(R_indep_thres={sp_stats['indep_thres']:.4f})")
         _diag(f"epoch{epoch}_pseudo_labels", pseudo_labels)
 
-        # Apply accumulated ML constraints to pseudo-labels every epoch
-        # This ensures NP3's merge decisions persist across DBSCAN re-clustering
+        # Apply accumulated ML constraints (can rescue singletons back into clusters)
         if all_must_links:
             from src.aas.np3 import _merge_must_links
-            pre_merge_clusters = int(pseudo_labels.max() + 1) if (pseudo_labels >= 0).any() else 0
+            pre_merge = int(pseudo_labels.max() + 1)
             pseudo_labels = _merge_must_links(pseudo_labels.copy(), all_must_links)
-            post_merge_clusters = int(pseudo_labels.max() + 1) if (pseudo_labels >= 0).any() else 0
-            if pre_merge_clusters != post_merge_clusters:
-                print(f"  ML merge: {pre_merge_clusters} → {post_merge_clusters} clusters "
-                      f"({pre_merge_clusters - post_merge_clusters} merged)")
+            post_merge = int(pseudo_labels.max() + 1)
+            if pre_merge != post_merge:
+                print(f"  ML merge: {pre_merge} → {post_merge} classes "
+                      f"({pre_merge - post_merge} merged)")
 
         # ── AAS injection every al_interval epochs (and epoch 0) ───────────
         aas_ran = False
@@ -623,8 +709,6 @@ def main():
             from src.visualization.umap_vis import plot_epoch_umap
             viz_dir = os.path.join(args.output_dir, args.dataset, str(args.run_id), 'visualizations')
             os.makedirs(viz_dir, exist_ok=True)
-            # gt_labels might be uninitialized if epoch > 0 and no AAS ran in this epoch
-            # Let's just fetch it again to be safe
             _viz_gt = train_df['identity'].values
             plot_epoch_umap(
                 epoch=epoch,
@@ -636,16 +720,8 @@ def main():
         except Exception as e:
             print(f"  [Viz] Failed to generate UMAP: {e}")
 
-        # Assign outliers to nearest cluster (Fix 1: breaks singleton inflation loop)
-        # Previously: each outlier got a unique class → 80 outliers = 80 phantom classes
-        # Now: each outlier joins its nearest cluster → 0 inflation
-        n_outliers_pre = int((pseudo_labels < 0).sum())
-        labels_for_memory = assign_outliers_to_nearest_cluster(pseudo_labels, features)
-        n_clusters = int(labels_for_memory.max() + 1) if (labels_for_memory >= 0).any() else 0
-        if n_outliers_pre > 0:
-            print(f"  Outlier assignment: {n_outliers_pre} outliers → nearest cluster "
-                  f"(memory classes: {n_clusters}, no inflation)")
-        memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
+        # Set memory labels (self-paced: reliable clusters + singletons)
+        memory.labels = torch.tensor(pseudo_labels, dtype=torch.long).to(device)
         _diag(f"epoch{epoch}_memory.labels", memory.labels)
 
         # Feature quality monitor (Fix 3: track intra/inter identity similarity)
@@ -657,6 +733,8 @@ def main():
                       train_iters=train_iters)
         _diag(f"epoch{epoch}_memory.features_post_train", memory.features)
 
+        lr_scheduler.step()
+
         # ── Checkpoint (latest + best) ─────────────────────────────────────
         epoch_loss = _last_epoch_loss[0]
         save_checkpoint(
@@ -666,6 +744,7 @@ def main():
             window_counter=window_counter,
             all_must_links=all_must_links,
             all_cannot_links=all_cannot_links,
+            indep_thres=indep_thres,
         )
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -676,6 +755,7 @@ def main():
                 window_counter=window_counter,
                 all_must_links=all_must_links,
                 all_cannot_links=all_cannot_links,
+                indep_thres=indep_thres,
             )
             print(f"  ★ New best loss: {best_loss:.6f} (saved best checkpoint)")
 
