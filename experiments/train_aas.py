@@ -81,6 +81,108 @@ def compute_budget(n_samples: int, budget_fraction: float) -> int:
     return max(1, int(n_pairs * budget_fraction))
 
 
+def assign_outliers_to_nearest_cluster(
+    pseudo_labels: np.ndarray,
+    features: np.ndarray,
+) -> np.ndarray:
+    """Assign DBSCAN outliers (label == -1) to the nearest cluster centroid.
+
+    Instead of giving each outlier its own singleton class (which inflates the
+    effective class count in contrastive memory and creates a positive feedback
+    loop of feature fragmentation), each outlier is assigned to the cluster
+    whose L2-normalised centroid has the highest cosine similarity.
+
+    Args:
+        pseudo_labels: (n,) cluster labels; -1 = outlier.
+        features:      (n, d) L2-normalised features.
+
+    Returns:
+        labels: (n,) with all outliers reassigned (no -1 values remain).
+    """
+    labels = pseudo_labels.copy()
+    outlier_mask = labels < 0
+    n_outliers = int(outlier_mask.sum())
+
+    if n_outliers == 0:
+        return labels
+
+    valid_mask = labels >= 0
+    if not valid_mask.any():
+        # Edge case: all samples are outliers — assign all to cluster 0
+        labels[:] = 0
+        return labels
+
+    # Compute L2-normalised centroids for each cluster
+    unique_clusters = np.unique(labels[valid_mask])
+    centroids = np.zeros((len(unique_clusters), features.shape[1]), dtype=np.float32)
+    cluster_id_map = {}  # index in centroids array → cluster label
+    for i, c in enumerate(unique_clusters):
+        c_feats = features[labels == c]
+        centroid = c_feats.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid /= norm
+        centroids[i] = centroid
+        cluster_id_map[i] = c
+
+    # Vectorised assignment: (n_outliers, d) @ (d, n_clusters) → similarities
+    outlier_indices = np.where(outlier_mask)[0]
+    outlier_feats = features[outlier_indices]            # (n_outliers, d)
+    sims = outlier_feats @ centroids.T                   # (n_outliers, n_clusters)
+    best_cluster_idx = sims.argmax(axis=1)               # (n_outliers,)
+
+    for i, idx in enumerate(outlier_indices):
+        labels[idx] = cluster_id_map[best_cluster_idx[i]]
+
+    return labels
+
+
+def log_feature_quality(
+    features: np.ndarray,
+    gt_labels: np.ndarray,
+    pseudo_labels: np.ndarray,
+    epoch: int,
+) -> None:
+    """Log per-epoch intra/inter identity cosine similarity (Fix 3).
+
+    Tracks whether training is improving or degrading the feature space.
+    Key diagnostic: if intra-identity sim increases and inter-identity sim
+    decreases over epochs, features are consolidating (good). If the gap
+    shrinks or intra drops, features are degenerating.
+    """
+    unique_ids = np.unique(gt_labels)
+    intra_sims = []
+    inter_sims = []
+
+    # Intra-identity: pairwise cosine sim within each GT identity
+    for gid in unique_ids:
+        mask = gt_labels == gid
+        id_feats = features[mask]
+        n = id_feats.shape[0]
+        if n > 1:
+            sim_matrix = id_feats @ id_feats.T
+            triu_idx = np.triu_indices(n, k=1)
+            intra_sims.extend(sim_matrix[triu_idx].tolist())
+
+    # Inter-identity: sample random cross-identity pairs (cap at 1000)
+    rng = np.random.default_rng(epoch)
+    for _ in range(min(1000, len(features) * 2)):
+        i, j = rng.choice(len(features), 2, replace=False)
+        if gt_labels[i] != gt_labels[j]:
+            inter_sims.append(float(features[i] @ features[j]))
+
+    intra = np.array(intra_sims) if intra_sims else np.array([0.0])
+    inter = np.array(inter_sims) if inter_sims else np.array([0.0])
+    gap = intra.mean() - inter.mean()
+
+    n_pseudo = int(pseudo_labels.max() + 1) if (pseudo_labels >= 0).any() else 0
+
+    print(f"  [FeatureQ] epoch={epoch} | "
+          f"intra: mean={intra.mean():.4f} min={intra.min():.4f} | "
+          f"inter: mean={inter.mean():.4f} max={inter.max():.4f} | "
+          f"gap={gap:.4f} | pseudo_clusters={n_pseudo}")
+
+
 @torch.no_grad()
 def extract_features_model(model, loader):
     """Extract L2-normalised features using the SpCL training model.
@@ -534,16 +636,20 @@ def main():
         except Exception as e:
             print(f"  [Viz] Failed to generate UMAP: {e}")
 
-        # Update memory labels (assign outliers to unique classes — vectorised)
-        n_valid = int((pseudo_labels >= 0).sum())
-        n_clusters = int(pseudo_labels.max() + 1) if n_valid > 0 else 0
-        labels_for_memory = pseudo_labels.copy()
-        outlier_mask = labels_for_memory < 0
-        labels_for_memory[outlier_mask] = np.arange(
-            n_clusters, n_clusters + outlier_mask.sum(), dtype=labels_for_memory.dtype
-        )
+        # Assign outliers to nearest cluster (Fix 1: breaks singleton inflation loop)
+        # Previously: each outlier got a unique class → 80 outliers = 80 phantom classes
+        # Now: each outlier joins its nearest cluster → 0 inflation
+        n_outliers_pre = int((pseudo_labels < 0).sum())
+        labels_for_memory = assign_outliers_to_nearest_cluster(pseudo_labels, features)
+        n_clusters = int(labels_for_memory.max() + 1) if (labels_for_memory >= 0).any() else 0
+        if n_outliers_pre > 0:
+            print(f"  Outlier assignment: {n_outliers_pre} outliers → nearest cluster "
+                  f"(memory classes: {n_clusters}, no inflation)")
         memory.labels = torch.tensor(labels_for_memory, dtype=torch.long).to(device)
         _diag(f"epoch{epoch}_memory.labels", memory.labels)
+
+        # Feature quality monitor (Fix 3: track intra/inter identity similarity)
+        log_feature_quality(features, gt_labels, pseudo_labels, epoch)
 
         train_loader.new_epoch()
         trainer.train(epoch, train_loader, optimizer,
